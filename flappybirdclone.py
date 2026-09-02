@@ -1,230 +1,304 @@
-import pygame
+"""A Flappy Bird clone built with pygame."""
+
 import random
-from pygame.sprite import Sprite
+from pathlib import Path
 
-#initialize pygame
-pygame.init()
+import pygame
 
-#images
-bird_Imgs = [pygame.image.load('images/bird_up.png'),
-               pygame.image.load('images/bird_mid.png'),
-               pygame.image.load('images/bird_down.png')]
-backgroundImg = pygame.image.load("images/background.png")
-game_overImg = pygame.image.load('images/game_over.png')
-groundImg = pygame.image.load('images/ground.png')
-bottom_pipeImg = pygame.image.load('images/pipe_bottom.png')
-top_pipeImg = pygame.image.load('images/pipe_top.png')
-startImg = pygame.image.load('images/start.png')
+IMAGE_DIR = Path(__file__).resolve().parent / "images"
+
+WIN_WIDTH = 551
+WIN_HEIGHT = 720
+FPS = 60
+SCROLL_SPEED = 2
+TEXT_COLOR = (255, 255, 255)
+
+BIRD_START_POS = (251, 300)
+GRAVITY = 0.5
+FLAP_VELOCITY = -8
+MAX_FALL_SPEED = 7
+ROTATION_FACTOR = -7
+ANIMATION_FRAMES = 30
+
+GROUND_Y = 520
+# ground.png's texture repeats every 24px but the image is 551px wide,
+# which is not a multiple of 24. Tiles therefore have to be spaced
+# 528px (22 * 24) apart to keep the diagonal lines aligned; spacing them
+# by the full image width would put a visible break at every seam.
+GROUND_SPACING = 528
+
+PIPE_SPAWN_X = 550
+PIPE_TOP_Y_RANGE = (-620, -500)
+PIPE_GAP_RANGE = (110, 150)
+PIPE_INTERVAL_RANGE = (80, 120)
+PIPE_DESPAWN_X = -50
+
+# The bird dies once it falls past this line, just above the ground.
+FLOOR_Y = 500
 
 
-#global variables
-fps = 60
-speed = 2
-score = 0
-high_score = 0
-font = pygame.font.Font('freesansbold.ttf', 32)
-birdPos = (251,300)
-gamestate = 'start'
-#window
-win_width = 551
-win_height = 720
-screen = pygame.display.set_mode((win_width,win_height))
+def load_image(name):
+    """Load a sprite from the images directory, ready for fast blitting."""
+    return pygame.image.load(IMAGE_DIR / name).convert_alpha()
 
-#bird class
+
+def load_images():
+    """Load every sprite. Must run after the display mode is set."""
+    return {
+        "background": load_image("background.png"),
+        "ground": load_image("ground.png"),
+        "pipe_top": load_image("pipe_top.png"),
+        "pipe_bottom": load_image("pipe_bottom.png"),
+        "game_over": load_image("game_over.png"),
+        "start": load_image("start.png"),
+        "bird_frames": [
+            load_image("bird_up.png"),
+            load_image("bird_mid.png"),
+            load_image("bird_down.png"),
+        ],
+    }
+
+
+def read_input():
+    """Drain the event queue for this frame.
+
+    Returns a ``(quit_requested, keys_pressed)`` pair. ``keys_pressed``
+    holds only keys that went down on this frame, so holding a key does
+    not repeat -- that is what stops the bird from flapping on its own.
+    """
+    quit_requested = False
+    keys_pressed = set()
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            quit_requested = True
+        elif event.type == pygame.KEYDOWN:
+            keys_pressed.add(event.key)
+    return quit_requested, keys_pressed
+
 
 class Bird(pygame.sprite.Sprite):
-    def __init__(self):
-        pygame.sprite.Sprite.__init__(self)
-        
-        self.image = bird_Imgs[0]
-        self.rect = self.image.get_rect()
-        self.rect.x = birdPos[0]
-        self.rect.y = birdPos[1]
-        self.vel = 0
-        self.index = 0
-        self.flap = False
+    """The player-controlled bird."""
 
-    def update(self,user_input):
-        #animate bird 
-        self.index += 1
-        if self.index >=30:
-            self.index = 0
-        self.image = bird_Imgs[self.index//10]
+    def __init__(self, frames):
+        super().__init__()
+        self.frames = frames
+        self.image = frames[0]
+        self.rect = self.image.get_rect(topleft=BIRD_START_POS)
+        self.y = float(self.rect.y)
+        self.velocity = 0.0
+        self.frame_index = 0
 
-        self.image = pygame.transform.rotate(self.image, self.vel * -7)
-    
-        self.vel += 0.5
-        if self.vel > 7:
-            self.vel = 7
-        if self.rect.y < 500:
-            self.rect.y += self.vel
-        if self.vel ==0:
-            self.flap = False           
-        
-        if user_input[pygame.K_SPACE] and not self.flap:
-            self.vel = -8
-            self.flap = True
-        
+    def flap(self):
+        """Send the bird upwards."""
+        self.velocity = FLAP_VELOCITY
+
+    def update(self):
+        self.frame_index = (self.frame_index + 1) % ANIMATION_FRAMES
+        frame = self.frame_index * len(self.frames) // ANIMATION_FRAMES
+        self.image = self.frames[frame]
+
+        self.velocity = min(self.velocity + GRAVITY, MAX_FALL_SPEED)
+        # Track the position as a float and round it into the rect only
+        # for drawing. pygame.Rect stores integers, so adding a velocity
+        # of less than 1 straight onto rect.y would truncate to no
+        # movement at all and make gravity lumpy near the top of an arc.
+        self.y += self.velocity
+        self.rect.y = round(self.y)
+
+    def draw(self, surface):
+        """Draw the bird, tilted to match how fast it is rising/falling."""
+        # Rotate a copy for display only. self.rect keeps the size of an
+        # unrotated frame, so the hitbox stays honest and the sprite does
+        # not drift away from it as the bird tilts.
+        rotated = pygame.transform.rotate(
+            self.image, self.velocity * ROTATION_FACTOR
+        )
+        surface.blit(rotated, rotated.get_rect(center=self.rect.center))
 
 
-#pipe class
 class Pipe(pygame.sprite.Sprite):
-    def __init__(self,x,y,pipeImg, pipeType):
-        pygame.sprite.Sprite.__init__(self)
-        self.image = pipeImg
-        self.rect = self.image.get_rect()
-        self.rect.x = x
-        self.rect.y = y
-        self.type = pipeType
-        self.enter, self.exit, self.passed = False, False, False
-    def update(self):
-        self.rect.x -= speed
-        if self.rect.x <= -50:
-            self.kill()
-        #score
-        global score
-        if self.type == 'top':
-            
-            if birdPos[0] > self.rect.topleft[0] and not self.passed:
-                self.enter = True
-            if birdPos[0] > self.rect.topright[0] and self.enter:
-                self.passed = True
-            if self.enter and self.passed and not self.exit:
-                self.exit = True
-                score += 1
-                print(score)    
+    """One half of a pipe pair, scrolling right to left."""
 
-#ground class
+    def __init__(self, x, y, image, pipe_type):
+        super().__init__()
+        self.image = image
+        self.rect = self.image.get_rect(topleft=(x, y))
+        self.pipe_type = pipe_type
+        self.scored = False
+
+    def update(self):
+        self.rect.x -= SCROLL_SPEED
+        if self.rect.x <= PIPE_DESPAWN_X:
+            self.kill()
+
+
 class Ground(pygame.sprite.Sprite):
-    def __init__(self,x,y):
-        Sprite.__init__(self)
-        self.image = groundImg
-        self.rect = self.image.get_rect()
-        self.rect.x = x
-        self.rect.y = y
-    # will be constantly updated in main loop
+    """A single tile of the scrolling ground."""
+
+    def __init__(self, x, y, image):
+        super().__init__()
+        self.image = image
+        self.rect = self.image.get_rect(topleft=(x, y))
+
     def update(self):
-        self.rect.x -= speed
-        #reset the ground to original position
-        if self.rect.x <-win_width:
+        self.rect.x -= SCROLL_SPEED
+        if self.rect.right < 0:
             self.kill()
 
 
+class Game:
+    """Owns the sprites and the score across a whole session."""
 
-# function to handle quitting.
-def ifQuit():
-    for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                exit()
+    def __init__(self, screen, images):
+        self.screen = screen
+        self.images = images
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.Font("freesansbold.ttf", 32)
+        self.high_score = 0
+        self.state = "start"
+        self.reset_round()
+
+    def reset_round(self):
+        """Rebuild everything that only lasts for a single attempt."""
+        self.bird = Bird(self.images["bird_frames"])
+        self.pipes = pygame.sprite.Group()
+        self.grounds = pygame.sprite.Group()
+        self.grounds.add(Ground(0, GROUND_Y, self.images["ground"]))
+        self.pipe_timer = 0
+        self.score = 0
+
+    def run(self):
+        """Run the game until the player closes the window."""
+        while True:
+            self.clock.tick(FPS)
+            quit_requested, keys = read_input()
+            if quit_requested:
+                return
+
+            if self.state == "start":
+                self.update_start(keys)
+            elif self.state == "play":
+                self.update_play(keys)
+            else:
+                self.update_end(keys)
+
+            pygame.display.update()
+
+    def update_start(self, keys):
+        self.draw_scene()
+        self.screen.blit(
+            self.images["start"],
+            (WIN_WIDTH // 2 - 100, WIN_HEIGHT // 2 - 200),
+        )
+        if pygame.K_SPACE in keys:
+            self.state = "play"
+            self.bird.flap()
+
+    def update_play(self, keys):
+        if pygame.K_SPACE in keys:
+            self.bird.flap()
+
+        self.bird.update()
+        self.pipes.update()
+        self.grounds.update()
+        self.spawn_ground()
+        self.spawn_pipes()
+        self.update_score()
+        self.draw_scene()
+
+        if self.has_crashed():
+            self.high_score = max(self.high_score, self.score)
+            self.state = "end"
+
+    def update_end(self, keys):
+        self.draw_scene()
+        self.screen.blit(
+            self.images["game_over"],
+            (WIN_WIDTH // 2 - 100, WIN_HEIGHT // 2 - 100),
+        )
+        if pygame.K_r in keys:
+            self.reset_round()
+            self.state = "start"
+
+    def spawn_ground(self):
+        """Keep the ground tiled across the screen as it scrolls."""
+        if self.grounds:
+            rightmost = max(ground.rect.x for ground in self.grounds)
+        else:
+            rightmost = -GROUND_SPACING
+        if rightmost <= 0:
+            self.grounds.add(
+                Ground(
+                    rightmost + GROUND_SPACING,
+                    GROUND_Y,
+                    self.images["ground"],
+                )
+            )
+
+    def spawn_pipes(self):
+        """Drop a new pipe pair in once the spawn timer runs out."""
+        if self.pipe_timer > 0:
+            self.pipe_timer -= 1
+            return
+
+        top_image = self.images["pipe_top"]
+        bottom_image = self.images["pipe_bottom"]
+        top_y = random.randint(*PIPE_TOP_Y_RANGE)
+        # The top pipe hangs off the top of the screen; the bottom one
+        # starts a gap below wherever the top pipe ends.
+        gap = random.randint(*PIPE_GAP_RANGE)
+        bottom_y = top_y + top_image.get_height() + gap
+
+        self.pipes.add(Pipe(PIPE_SPAWN_X, top_y, top_image, "top"))
+        self.pipes.add(
+            Pipe(PIPE_SPAWN_X, bottom_y, bottom_image, "bottom")
+        )
+        self.pipe_timer = random.randint(*PIPE_INTERVAL_RANGE)
+
+    def update_score(self):
+        """Award a point per pipe pair the bird has fully cleared."""
+        for pipe in self.pipes:
+            if pipe.pipe_type != "top" or pipe.scored:
+                continue
+            if pipe.rect.right < self.bird.rect.left:
+                pipe.scored = True
+                self.score += 1
+
+    def has_crashed(self):
+        """Report whether the bird hit a pipe, the ground, or the sky."""
+        if pygame.sprite.spritecollideany(self.bird, self.pipes):
+            return True
+        if pygame.sprite.spritecollideany(self.bird, self.grounds):
+            return True
+        return self.bird.rect.y < 0 or self.bird.rect.y > FLOOR_Y
+
+    def draw_scene(self):
+        # Ground goes on top of the pipes so they look like they come up
+        # from behind it rather than sitting over the dirt.
+        self.screen.blit(self.images["background"], (0, 0))
+        self.pipes.draw(self.screen)
+        self.grounds.draw(self.screen)
+        self.bird.draw(self.screen)
+        self.draw_scores()
+
+    def draw_scores(self):
+        score_text = self.font.render(
+            f"Score: {self.score}", True, TEXT_COLOR
+        )
+        high_score_text = self.font.render(
+            f"High score: {self.high_score}", True, TEXT_COLOR
+        )
+        self.screen.blit(score_text, (10, 10))
+        self.screen.blit(high_score_text, (10, 50))
 
 
 def main():
+    pygame.init()
+    screen = pygame.display.set_mode((WIN_WIDTH, WIN_HEIGHT))
     pygame.display.set_caption("Flappy Bird!")
-    clock = pygame.time.Clock()
-    
-    # initialize all
-    # add to game
-    groundx, groundy = 0,520
-    grounds = pygame.sprite.Group()
-    grounds.add(Ground(groundx,groundy))
+    Game(screen, load_images()).run()
+    pygame.quit()
 
-    #init bird
-    bird = pygame.sprite.GroupSingle()
-    bird.add(Bird())
 
-    pipe_clock = 0
-    pipes = pygame.sprite.Group()
-    
-    global speed
-    global gamestate
-    global score
-    global high_score
-    global win_height
-    global win_width
-
-    #start screen
-    while gamestate == 'start':
-        score = 0
-        clock.tick(fps)
-        ifQuit()
-        user_input = pygame.key.get_pressed()
-        screen.blit(backgroundImg,(0,0))
-        screen.blit(groundImg,(0,520))
-        screen.blit(bird_Imgs[0],(251,300))
-        screen.blit(startImg,(win_width//2-100,win_height//2-200))
-        if user_input [pygame.K_SPACE]:
-            gamestate = 'play'
-            screen.fill((0,0,0))
-        pygame.display.update()
-
-    
-    #once space key is hit, run game
-    while gamestate == 'play':
-        clock.tick(fps)
-        ifQuit()
-        user_input = pygame.key.get_pressed()
-        #blit background
-        screen.blit(backgroundImg,(0,0))
-        #drawing ground, pipes, and bird
-        grounds.draw(screen)
-        bird.draw(screen)
-        pipes.draw(screen)
-        #update sprites
-        pipes.update()
-        bird.update(user_input)
-        grounds.update()
-        #update score
-        score_text = font.render(f'Score: {score}', True, (255,255,255))
-        high_score_text = font.render(f'High score: {high_score}', True, (255,255,255))
-
-        screen.blit(score_text, (10,10))
-        screen.blit(high_score_text, (10,50))
-        
-        
-        #check for collision/end game
-        collision_pipes = pygame.sprite.spritecollide(bird.sprites()[0], pipes, False)
-        collision_ground = pygame.sprite.spritecollide(bird.sprites()[0], grounds, False)
-        if collision_pipes or collision_ground or bird.sprites()[0].rect.y < 0 or bird.sprites()[0].rect.y > 500:
-            if score >= high_score:
-                high_score = score
-            gamestate = 'end'
-
-        
-        #add ground
-        if len(grounds) <= 2:
-            #-23 to align lines
-            grounds.add(Ground(win_width-23,groundy))
-
-        #add pipes
-        if pipe_clock <= 0:
-            x_top, x_bottom = 550, 550
-            y_top = random.randint(-620, -500)
-            y_bottom = y_top + random.randint(110, 150) + bottom_pipeImg.get_height()
-            pipes.add(Pipe(x_top, y_top, top_pipeImg, 'top'))
-            pipes.add(Pipe(x_bottom, y_bottom, bottom_pipeImg, 'bottom'))
-            pipe_clock = random.randint(80,120)
-        pipe_clock -= 1
-        #update screen
-        pygame.display.update()
-
-    while gamestate == 'end':
-        clock.tick(fps)
-        ifQuit()
-        user_input = pygame.key.get_pressed()
-        screen.blit(backgroundImg,(0,0))
-        screen.blit(groundImg,(0,520))
-        bird.draw(screen)
-        grounds.draw(screen)
-        pipes.draw(screen)
-        screen.blit(game_overImg,(win_width//2-100,win_height//2-100))
-        score_text = font.render(f'Score: {score}', True, (255,255,255))
-        high_score_text = font.render(f'High score: {high_score}', True, (255,255,255))
-        screen.blit(score_text, (10,10))
-        screen.blit(high_score_text, (10,50))
-        pygame.display.update()
-        if user_input[pygame.K_r]:
-            gamestate = 'start'
-            main()
-            
-main()
+if __name__ == "__main__":
+    main()

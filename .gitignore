@@ -1,0 +1,9 @@
+virtualenv/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+tempCodeRunnerFile.py
+build/
+*.egg-info/
+.DS_Store

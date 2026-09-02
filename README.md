@@ -14,23 +14,57 @@ pip install -r requirements.txt
 python flappybirdclone.py
 ```
 
+## Running it in a browser
+
+The game also compiles to WebAssembly via [pygbag](https://pypi.org/project/pygbag/),
+so it runs in a browser as real CPython — not a JavaScript rewrite.
+
+```bash
+pip install pygbag
+python build_web.py            # writes build/web
+python build_web.py --serve    # build, then serve on localhost:8000
+```
+
+`build/web` is a static folder: drop it on any host and embed it in an
+`<iframe>`. The bundle is ~77KB; the CPython and pygame runtime comes
+from the pygbag CDN on first load and is cached after that.
+
+Build it with `build_web.py` rather than by running `pygbag` against the
+repo directly. pygbag packs *every* file in the folder it is given, and
+its ignore filter does not catch a local `.venv` — building in place
+sweeps the virtualenv into the download and turns 77KB into 12MB.
+
 ## Controls
 
-| Key     | Action                        |
-| ------- | ----------------------------- |
-| `Space` | Start the game / flap         |
-| `R`     | Restart after a game over     |
+| Input          | Action                    |
+| -------------- | ------------------------- |
+| `Space` / tap  | Start the game / flap     |
+| `R` / tap      | Restart after a game over |
+
+Tapping works the same as the keyboard, so it plays on a touchscreen.
 
 Score a point for every pipe pair you clear. The high score persists until
 you close the window.
 
 ## How it works
 
-The game runs a single loop at 60 FPS with three states — `start`, `play`
-and `end` — driven by the `Game` class in
-[`flappybirdclone.py`](flappybirdclone.py).
+The game runs a single async loop at 60 FPS with three states — `start`,
+`play` and `end` — driven by the `Game` class in
+[`flappybirdclone.py`](flappybirdclone.py). The same file runs natively
+and in the browser; there is no separate web version.
 
 A few implementation details worth knowing if you read the source:
+
+- **The loop is `async` and yields every frame.** A browser tab has one
+  thread driving everything, so without an `await asyncio.sleep(0)` per
+  frame the page just freezes.
+- **`main.py` imports pygame even though it never uses it directly.**
+  pygbag scans only the entry file to decide which packages to preload
+  into the browser runtime. Drop that import and pygame is never loaded,
+  and the game dies on `module 'pygame' has no attribute 'sprite'`.
+  Reach for `pygame.sprite.Sprite` by attribute, too — pygbag reads
+  `import pygame.sprite` as a third-party package and goes looking for
+  it on PyPI.
 
 - **The bird's position is tracked as a float**, not in its `Rect`.
   `pygame.Rect` stores integers, so adding a sub-pixel velocity directly to

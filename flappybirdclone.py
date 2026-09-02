@@ -1,5 +1,12 @@
-"""A Flappy Bird clone built with pygame."""
+"""A Flappy Bird clone built with pygame.
 
+The loop is async so the same file runs both natively and in a browser
+under pygbag, which compiles this to WebAssembly. A browser tab has one
+thread driving everything, so the loop has to hand control back every
+frame via ``await asyncio.sleep(0)`` or the page simply freezes.
+"""
+
+import asyncio
 import random
 from pathlib import Path
 
@@ -36,10 +43,27 @@ PIPE_DESPAWN_X = -50
 # The bird dies once it falls past this line, just above the ground.
 FLOOR_Y = 500
 
+# Frames to ignore input for after a crash, so the tap or keypress that
+# killed you does not immediately restart the game on a touchscreen.
+RESTART_DELAY = 30
+
 
 def load_image(name):
     """Load a sprite from the images directory, ready for fast blitting."""
     return pygame.image.load(IMAGE_DIR / name).convert_alpha()
+
+
+def load_font(size):
+    """Load the scoreboard font, falling back to whatever is available.
+
+    pygame ships freesansbold.ttf, but the file is not guaranteed to be
+    bundled into every WebAssembly build, and a missing font would
+    otherwise take the whole page down on startup.
+    """
+    try:
+        return pygame.font.Font("freesansbold.ttf", size)
+    except (OSError, FileNotFoundError):
+        return pygame.font.SysFont(None, size)
 
 
 def load_images():
@@ -62,18 +86,23 @@ def load_images():
 def read_input():
     """Drain the event queue for this frame.
 
-    Returns a ``(quit_requested, keys_pressed)`` pair. ``keys_pressed``
-    holds only keys that went down on this frame, so holding a key does
-    not repeat -- that is what stops the bird from flapping on its own.
+    Returns a ``(quit_requested, keys_pressed, tapped)`` triple.
+    ``keys_pressed`` holds only keys that went down on this frame, so
+    holding a key does not repeat -- that is what stops the bird from
+    flapping on its own. ``tapped`` covers a mouse click or a touch,
+    which is the only input a phone has.
     """
     quit_requested = False
     keys_pressed = set()
+    tapped = False
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             quit_requested = True
         elif event.type == pygame.KEYDOWN:
             keys_pressed.add(event.key)
-    return quit_requested, keys_pressed
+        elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN):
+            tapped = True
+    return quit_requested, keys_pressed, tapped
 
 
 class Bird(pygame.sprite.Sprite):
@@ -153,7 +182,7 @@ class Game:
         self.screen = screen
         self.images = images
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.Font("freesansbold.ttf", 32)
+        self.font = load_font(32)
         self.high_score = 0
         self.state = "start"
         self.reset_round()
@@ -165,37 +194,41 @@ class Game:
         self.grounds = pygame.sprite.Group()
         self.grounds.add(Ground(0, GROUND_Y, self.images["ground"]))
         self.pipe_timer = 0
+        self.restart_timer = 0
         self.score = 0
 
-    def run(self):
+    async def run(self):
         """Run the game until the player closes the window."""
         while True:
             self.clock.tick(FPS)
-            quit_requested, keys = read_input()
+            quit_requested, keys, tapped = read_input()
             if quit_requested:
                 return
 
             if self.state == "start":
-                self.update_start(keys)
+                self.update_start(keys, tapped)
             elif self.state == "play":
-                self.update_play(keys)
+                self.update_play(keys, tapped)
             else:
-                self.update_end(keys)
+                self.update_end(keys, tapped)
 
             pygame.display.update()
+            # Yield to the browser's event loop. On desktop this is a
+            # no-op; in the browser it is what keeps the tab responsive.
+            await asyncio.sleep(0)
 
-    def update_start(self, keys):
+    def update_start(self, keys, tapped):
         self.draw_scene()
         self.screen.blit(
             self.images["start"],
             (WIN_WIDTH // 2 - 100, WIN_HEIGHT // 2 - 200),
         )
-        if pygame.K_SPACE in keys:
+        if pygame.K_SPACE in keys or tapped:
             self.state = "play"
             self.bird.flap()
 
-    def update_play(self, keys):
-        if pygame.K_SPACE in keys:
+    def update_play(self, keys, tapped):
+        if pygame.K_SPACE in keys or tapped:
             self.bird.flap()
 
         self.bird.update()
@@ -208,15 +241,19 @@ class Game:
 
         if self.has_crashed():
             self.high_score = max(self.high_score, self.score)
+            self.restart_timer = RESTART_DELAY
             self.state = "end"
 
-    def update_end(self, keys):
+    def update_end(self, keys, tapped):
         self.draw_scene()
         self.screen.blit(
             self.images["game_over"],
             (WIN_WIDTH // 2 - 100, WIN_HEIGHT // 2 - 100),
         )
-        if pygame.K_r in keys:
+        if self.restart_timer > 0:
+            self.restart_timer -= 1
+            return
+        if pygame.K_r in keys or tapped:
             self.reset_round()
             self.state = "start"
 
@@ -292,13 +329,13 @@ class Game:
         self.screen.blit(high_score_text, (10, 50))
 
 
-def main():
+async def main():
     pygame.init()
     screen = pygame.display.set_mode((WIN_WIDTH, WIN_HEIGHT))
     pygame.display.set_caption("Flappy Bird!")
-    Game(screen, load_images()).run()
+    await Game(screen, load_images()).run()
     pygame.quit()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

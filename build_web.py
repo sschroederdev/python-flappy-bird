@@ -13,6 +13,7 @@ Usage::
 
     python build_web.py            # build into build/web
     python build_web.py --serve    # build, then serve it on :8000
+    python build_web.py --strict   # fail if a trim no longer matches
 """
 
 import argparse
@@ -36,7 +37,7 @@ RUNTIME_FILES = ["main.py", "flappybirdclone.py"]
 RUNTIME_DIRS = ["images"]
 
 
-def trim(output_dir, app_name):
+def trim(output_dir, app_name, strict=False):
     """Strip what the embedded build never uses.
 
     None of this is large next to the ~10MB CPython runtime the page
@@ -75,11 +76,23 @@ def trim(output_dir, app_name):
         ('platform.document.body.style.background = "#7f7f7f"',
          'platform.document.body.style.background = "transparent"'),
     ]
+    missing = [old for old, _ in replacements if old not in html]
     for old, new in replacements:
-        if old not in html:
-            print(f"  warning: could not trim, pattern not found: {old[:60]}")
         html = html.replace(old, new)
     index.write_text(html, encoding="utf-8")
+
+    if missing:
+        # A pygbag upgrade can change the markup out from under these
+        # patterns. The build still succeeds, so nothing else would
+        # notice until the embed showed up grey on the live page.
+        for old in missing:
+            print(f"  warning: could not trim, pattern not found: "
+                  f"{old[:60]}")
+        if strict:
+            raise SystemExit(
+                f"--strict: {len(missing)} of {len(replacements)} trim "
+                f"patterns did not match; pygbag's output has changed."
+            )
 
 
 def stage(staging_dir):
@@ -140,6 +153,11 @@ def main():
     parser.add_argument(
         "--port", type=int, default=8000, help="port for --serve"
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="fail if any of the trims to index.html no longer match",
+    )
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -150,7 +168,7 @@ def main():
         build(staging_dir)
         collect(staging_dir)
 
-    trim(OUTPUT_DIR, APP_NAME)
+    trim(OUTPUT_DIR, APP_NAME, strict=args.strict)
 
     total = sum(
         path.stat().st_size

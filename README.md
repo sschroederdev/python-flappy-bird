@@ -4,6 +4,7 @@ A Flappy Bird clone written in Python with pygame.
 
 ![Python](https://img.shields.io/badge/python-3.11-blue)
 ![pygame](https://img.shields.io/badge/pygame-2.6-green)
+[![CI](https://github.com/sschroederdev/python-flappy-bird/actions/workflows/ci.yml/badge.svg)](https://github.com/sschroederdev/python-flappy-bird/actions/workflows/ci.yml)
 
 ## Running it
 
@@ -33,6 +34,65 @@ Build it with `build_web.py` rather than by running `pygbag` against the
 repo directly. pygbag packs *every* file in the folder it is given, and
 its ignore filter does not catch a local `.venv` — building in place
 sweeps the virtualenv into the download and turns 77KB into 12MB.
+
+## Tests and CI
+
+```bash
+pip install -r requirements-dev.txt
+pycodestyle .
+python -m unittest discover -s tests -t .
+```
+
+The tests drive the state machine a frame at a time instead of running
+`Game.run`, which loops until the window closes, and they run headless
+under SDL's dummy video driver. They lean towards the bugs listed in
+[How it works](#how-it-works) below, since those are the ones a refactor
+is most likely to reintroduce.
+
+[`ci.yml`](.github/workflows/ci.yml) runs the same two commands on every
+pull request, then builds the bundle with `--strict` and checks the
+output. `--strict` turns a trim that no longer matches into a build
+failure: a pygbag upgrade can change the markup those patterns rewrite,
+and without it the build would still succeed and ship an embed with a
+grey box around it.
+
+## Publishing
+
+On a push to `main`, CI puts the freshly built `build/web` on a branch in
+the portfolio site's repo and opens a pull request. Merging it is what
+ships the new build. The demo there is an `<iframe>` served from the
+site's `public/` folder so that it is same-origin, so the built files
+have to live in that repo rather than on a host of their own.
+
+The pull request is worth almost nothing to read — it is a regenerated
+`.tar.gz` and an `index.html` — so review it by opening the Vercel
+preview the site builds for the PR and playing the game on it.
+
+Every run reuses one branch, `flappy-bird-build`, rebuilt from the
+website's default branch and force-pushed. So a second push to `main`
+updates the open pull request rather than opening another one, and the
+branch is never more than one commit ahead. Nothing hand-written lives on
+it; do not commit to it expecting the commit to survive.
+
+Publishing needs three settings on this repository, under
+**Settings > Secrets and variables > Actions**:
+
+| Setting | Kind | Value |
+| ------- | ---- | ----- |
+| `WEBSITE_REPO` | Variable | `sschroederdev/website` |
+| `WEBSITE_PATH` | Variable | `public/flappy` |
+| `WEBSITE_REPO_TOKEN` | Secret | A fine-grained PAT |
+
+The built-in `GITHUB_TOKEN` only reaches the repository it runs in, so
+writing to another one needs a [fine-grained PAT](https://github.com/settings/personal-access-tokens)
+scoped to the website repo alone, with **Contents: Read and write** and
+**Pull requests: Read and write**. It expires on whatever date you give
+it, and publishing fails until it is renewed.
+
+Until all three are set the publish job fails on its first step, by
+design — `actions/checkout` reads an empty `repository:` as *this* repo,
+and the step after it deletes the target directory. Lint, tests and the
+build are a separate job and keep passing either way.
 
 ## Controls
 

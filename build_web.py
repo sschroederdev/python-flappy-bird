@@ -16,7 +16,10 @@ Usage::
 """
 
 import argparse
+import functools
+import http.server
 import shutil
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -25,9 +28,58 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_DIR / "build" / "web"
 
+# pygbag names the bundle after the folder it builds from.
+APP_NAME = "flappy-bird"
+
 # Everything the game opens at runtime, and nothing else.
 RUNTIME_FILES = ["main.py", "flappybirdclone.py"]
 RUNTIME_DIRS = ["images"]
+
+
+def trim(output_dir, app_name):
+    """Strip what the embedded build never uses.
+
+    None of this is large next to the ~10MB CPython runtime the page
+    pulls from the pygbag CDN, but it removes a dead file, a request
+    that 404s, and the debug terminal, which does not belong in an
+    embed on a portfolio page.
+    """
+    # The .apk is only read when the page is hosted on itch.io; every
+    # other host takes the .tar.gz. See the loader in index.html.
+    apk = output_dir / f"{app_name}.apk"
+    if apk.exists():
+        apk.unlink()
+
+    # pygbag's own favicon, irrelevant inside an iframe.
+    favicon = output_dir / "favicon.png"
+    if favicon.exists():
+        favicon.unlink()
+
+    index = output_dir / "index.html"
+    html = index.read_text(encoding="utf-8")
+    replacements = [
+        # vtx is the xterm.js debug console (~90KB over the wire) and
+        # snd is the audio shim. This game has neither a console worth
+        # showing nor any sound.
+        ('data-os="vtx,snd,gui"', 'data-os="gui"'),
+        ('<link rel="icon" type="image/png" href="favicon.png" '
+         'sizes="16x16">', ""),
+        # pygbag emits this with a doubled slash and the CDN 404s it.
+        ('<script src="https://pygame-web.github.io/cdn/0.9.3'
+         '//browserfs.min.js"></script>', ""),
+        # pygbag paints the page around the canvas a flat grey, once in
+        # CSS and again from JS after boot. Both have to go transparent
+        # so an iframe picks up whatever the host page is using and the
+        # embed works in light and dark themes alike.
+        ("background-color:powderblue;", "background-color: transparent;"),
+        ('platform.document.body.style.background = "#7f7f7f"',
+         'platform.document.body.style.background = "transparent"'),
+    ]
+    for old, new in replacements:
+        if old not in html:
+            print(f"  warning: could not trim, pattern not found: {old[:60]}")
+        html = html.replace(old, new)
+    index.write_text(html, encoding="utf-8")
 
 
 def stage(staging_dir):
@@ -38,12 +90,12 @@ def stage(staging_dir):
         shutil.copytree(PROJECT_DIR / name, staging_dir / name)
 
 
-def build(staging_dir, serve):
+def build(staging_dir):
     """Run pygbag over the staged folder."""
-    command = [sys.executable, "-m", "pygbag", "--title", "Flappy Bird"]
-    if not serve:
-        command.append("--build")
-    command.append(str(staging_dir))
+    command = [
+        sys.executable, "-m", "pygbag", "--build",
+        "--title", "Flappy Bird", str(staging_dir),
+    ]
     subprocess.run(command, check=True)
 
 
@@ -62,6 +114,22 @@ def collect(staging_dir):
     shutil.copytree(built, OUTPUT_DIR, dirs_exist_ok=True)
 
 
+def serve(port):
+    """Serve the trimmed build, the way a real host would.
+
+    pygbag's own test server rewrites the CDN URLs to proxy through
+    itself. Serving the files as they are keeps the page pointed at the
+    real CDN, which is what it will do once it is deployed.
+    """
+    handler = functools.partial(
+        http.server.SimpleHTTPRequestHandler, directory=str(OUTPUT_DIR)
+    )
+    with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
+        print(f"\nServing {OUTPUT_DIR} on http://localhost:{port}/")
+        print("Ctrl+C to stop.")
+        httpd.serve_forever()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -69,28 +137,34 @@ def main():
         action="store_true",
         help="serve the build on http://localhost:8000 when it is done",
     )
+    parser.add_argument(
+        "--port", type=int, default=8000, help="port for --serve"
+    )
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
         # pygbag names the bundle after this folder.
-        staging_dir = Path(tmp) / "flappy-bird"
+        staging_dir = Path(tmp) / APP_NAME
         staging_dir.mkdir()
         stage(staging_dir)
-        build(staging_dir, args.serve)
-        if not args.serve:
-            collect(staging_dir)
+        build(staging_dir)
+        collect(staging_dir)
 
-    if not args.serve:
-        total = sum(
-            path.stat().st_size
-            for path in OUTPUT_DIR.rglob("*")
-            if path.is_file()
-        )
-        print(f"\nBuilt {OUTPUT_DIR} ({total / 1024:.0f} KB)")
-        for path in sorted(OUTPUT_DIR.rglob("*")):
-            if path.is_file():
-                size = path.stat().st_size / 1024
-                print(f"  {path.relative_to(OUTPUT_DIR)}  {size:.0f} KB")
+    trim(OUTPUT_DIR, APP_NAME)
+
+    total = sum(
+        path.stat().st_size
+        for path in OUTPUT_DIR.rglob("*")
+        if path.is_file()
+    )
+    print(f"\nBuilt {OUTPUT_DIR} ({total / 1024:.0f} KB)")
+    for path in sorted(OUTPUT_DIR.rglob("*")):
+        if path.is_file():
+            size = path.stat().st_size / 1024
+            print(f"  {path.relative_to(OUTPUT_DIR)}  {size:.0f} KB")
+
+    if args.serve:
+        serve(args.port)
 
 
 if __name__ == "__main__":

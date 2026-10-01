@@ -1,0 +1,5 @@
+# Everything CI needs on top of requirements.txt. The tests themselves run
+# on stdlib unittest, so there is no test runner to install.
+pycodestyle>=2.14
+pyflakes>=3.4
+pygbag>=0.9.3

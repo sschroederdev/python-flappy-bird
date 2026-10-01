@@ -1,0 +1,207 @@
+# Lint, test and build on every pull request; on main, also push the built
+# bundle into the portfolio site.
+#
+# The demo on the site is an <iframe> pointed at a path under its own
+# public/ folder, so it is same-origin on purpose. That means the built
+# files have to live in the website repo rather than on a separate host,
+# and publishing is a commit over there rather than a deploy from here.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  # A new push supersedes the run still going for the same branch, except
+  # on main: cancelling a run mid-publish would leave the website repo
+  # holding half a bundle.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Lint, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: |
+          pycodestyle .
+          pyflakes $(git ls-files '*.py')
+
+      - name: Test
+        # SDL needs a display it will never get on a runner. The dummy
+        # driver gives the tests a real surface without a window.
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python -m unittest discover --start-directory tests --top-level-directory . --verbose
+
+      - name: Build the web bundle
+        # --strict turns a trim that no longer matches into a failure. A
+        # pygbag upgrade can change the markup these patterns rewrite, and
+        # the build would otherwise succeed and ship a grey-boxed embed.
+        run: python build_web.py --strict
+
+      - name: Check the bundle is what the page expects
+        run: |
+          test -f build/web/index.html
+          test -f build/web/flappy-bird.tar.gz
+          # The trims that matter most to the embed, asserted on the
+          # output rather than on the patterns that produced it.
+          grep -q 'data-os="gui"' build/web/index.html
+          ! grep -q 'vtx' build/web/index.html
+          ! grep -q 'powderblue' build/web/index.html
+          ! test -e build/web/flappy-bird.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-bundle
+          path: build/web
+          if-no-files-found: error
+
+  publish:
+    name: Open a build PR on the website
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Serialise publishes so two pushes cannot race on the same branch in
+    # the website repo. Never cancelled: see the note on the group above.
+    concurrency:
+      group: publish-website
+      cancel-in-progress: false
+    env:
+      # One machine-owned branch, recreated from the website's default
+      # branch every run, so repeated pushes to main keep updating a
+      # single pull request instead of opening a pile of them.
+      BUILD_BRANCH: flappy-bird-build
+    steps:
+      - name: Check the publish target is configured
+        # actions/checkout treats an empty `repository:` as this repo, so
+        # an unset variable would send the rm -rf and the commit below at
+        # this repository instead of the website. Fail loudly first.
+        env:
+          TARGET_REPO: ${{ vars.WEBSITE_REPO }}
+          TARGET_PATH: ${{ vars.WEBSITE_PATH }}
+          TARGET_TOKEN: ${{ secrets.WEBSITE_REPO_TOKEN }}
+        run: |
+          missing=""
+          [ -n "$TARGET_REPO" ] || missing="$missing vars.WEBSITE_REPO"
+          [ -n "$TARGET_PATH" ] || missing="$missing vars.WEBSITE_PATH"
+          [ -n "$TARGET_TOKEN" ] || missing="$missing secrets.WEBSITE_REPO_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::Not configured to publish. Missing:$missing"
+            exit 1
+          fi
+          case "$TARGET_PATH" in
+            /*|*..*)
+              echo "::error::WEBSITE_PATH must be a relative path inside the repo"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-bundle
+          path: bundle
+
+      - name: Check out the website
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.WEBSITE_REPO }}
+          # GITHUB_TOKEN only reaches this repository, so writing to
+          # another one needs a fine-grained PAT with Contents and Pull
+          # requests both set to read and write on the website repo.
+          token: ${{ secrets.WEBSITE_REPO_TOKEN }}
+          path: website
+          # No `ref:`, so this lands on the website's default branch,
+          # which is what the pull request will target. Full history
+          # because a server will refuse a branch pushed from a shallow
+          # clone.
+          fetch-depth: 0
+
+      - name: Replace the bundle
+        env:
+          TARGET_PATH: ${{ vars.WEBSITE_PATH }}
+        # Wholesale replace rather than copy over the top, so a file that
+        # pygbag stops emitting does not linger in the website repo.
+        run: |
+          rm -rf "website/$TARGET_PATH"
+          mkdir -p "website/$TARGET_PATH"
+          cp -R bundle/. "website/$TARGET_PATH/"
+          ls -l "website/$TARGET_PATH"
+
+      - name: Commit the bundle to a branch
+        id: commit
+        working-directory: website
+        env:
+          TARGET_PATH: ${{ vars.WEBSITE_PATH }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BUILD_BRANCH"
+          git add -A -- "$TARGET_PATH"
+          # Compares against the default branch we just branched from, so
+          # this is "does the site already serve these bytes". pygbag's
+          # .tar.gz embeds mtimes, so an unchanged game usually still
+          # rebuilds to different bytes and this rarely skips.
+          if git diff --cached --quiet; then
+            echo "The site already has this bundle; no pull request needed."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit \
+            -m "Update the Flappy Bird build" \
+            -m "From ${{ github.repository }}@${{ github.sha }}."
+          # Force, because the branch is rebuilt from the default branch
+          # on every run rather than added to. It holds generated output
+          # and nothing else, so there is no hand-written work to lose.
+          git push --force origin "HEAD:refs/heads/$BUILD_BRANCH"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the pull request
+        if: steps.commit.outputs.changed == 'true'
+        working-directory: website
+        env:
+          GH_TOKEN: ${{ secrets.WEBSITE_REPO_TOKEN }}
+          TARGET_REPO: ${{ vars.WEBSITE_REPO }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          # The force-push above already updated any PR that was open on
+          # this branch, so only open one when there is not one already.
+          url=$(gh pr list --repo "$TARGET_REPO" --head "$BUILD_BRANCH" \
+            --state open --json url --jq '.[0].url // empty')
+
+          if [ -n "$url" ]; then
+            echo "Updated the open pull request."
+          else
+            cat > /tmp/pr-body.md <<BODY
+          Rebuilt from [\`${GITHUB_SHA:0:7}\`](https://github.com/$SOURCE_REPO/commit/$GITHUB_SHA) on \`$SOURCE_REPO\`.
+
+          Generated by \`build_web.py\`, so there is nothing here to review line by line. The quickest check is the Vercel preview for this pull request: open the project page and press play.
+
+          This branch is recreated on every push to \`main\` on the game's repo, so this pull request updates in place rather than a new one appearing each time.
+          BODY
+            url=$(gh pr create --repo "$TARGET_REPO" --head "$BUILD_BRANCH" \
+              --title "Update the Flappy Bird build" \
+              --body-file /tmp/pr-body.md)
+            echo "Opened a pull request."
+          fi
+
+          echo "[Review the build PR on the website]($url)" >> "$GITHUB_STEP_SUMMARY"
